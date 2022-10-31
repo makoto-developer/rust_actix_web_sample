@@ -1,137 +1,111 @@
-use std::{convert::Infallible, io};
+use actix_web::{error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use futures_util::StreamExt as _;
+use json::JsonValue;
+use serde::{Deserialize, Serialize};
 
-use actix_files::{Files, NamedFile};
-use actix_session::{storage::CookieSessionStore, Session, SessionMiddleware};
-use actix_web::{
-    error, get,
-    http::{
-        header::{self, ContentType},
-        Method, StatusCode,
-    },
-    middleware, web, App, Either, HttpRequest, HttpResponse, HttpServer, Responder, Result,
-};
-use async_stream::stream;
-
-// NOTE: Not a suitable session key for production.
-static SESSION_SIGNING_KEY: &[u8] = &[0; 64];
-
-/// favicon handler
-#[get("/favicon")]
-async fn favicon() -> Result<impl Responder> {
-    Ok(NamedFile::open("static/favicon.ico")?)
+#[derive(Debug, Serialize, Deserialize)]
+struct MyObj {
+    name: String,
+    number: i32,
 }
 
-/// simple index handler
-#[get("/welcome")]
-async fn welcome(req: HttpRequest, session: Session) -> Result<HttpResponse> {
-    println!("{req:?}");
-
-    // session
-    let mut counter = 1;
-    if let Some(count) = session.get::<i32>("counter")? {
-        println!("SESSION value: {count}");
-        counter = count + 1;
-    }
-
-    // set counter to session
-    session.insert("counter", counter)?;
-
-    // response
-    Ok(HttpResponse::build(StatusCode::OK)
-        .content_type(ContentType::plaintext())
-        .body(include_str!("../static/welcome.html")))
+/// This handler uses json extractor
+async fn index(item: web::Json<MyObj>) -> HttpResponse {
+    println!("model: {:?}", &item);
+    HttpResponse::Ok().json(item.0) // <- send response
 }
 
-async fn default_handler(req_method: Method) -> Result<impl Responder> {
-    match req_method {
-        Method::GET => {
-            let file = NamedFile::open("static/404.html")?
-                .customize()
-                .with_status(StatusCode::NOT_FOUND);
-            Ok(Either::Left(file))
+/// This handler uses json extractor with limit
+async fn extract_item(item: web::Json<MyObj>, req: HttpRequest) -> HttpResponse {
+    println!("request: {req:?}");
+    println!("model: {item:?}");
+
+    HttpResponse::Ok().json(item.0) // <- send json response
+}
+
+const MAX_SIZE: usize = 262_144; // max payload size is 256k
+
+/// This handler manually load request payload and parse json object
+async fn index_manual(mut payload: web::Payload) -> Result<HttpResponse, Error> {
+    // payload is a stream of Bytes objects
+    let mut body = web::BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk?;
+        // limit max size of in-memory payload
+        if (body.len() + chunk.len()) > MAX_SIZE {
+            return Err(error::ErrorBadRequest("overflow"));
         }
-        _ => Ok(Either::Right(HttpResponse::MethodNotAllowed().finish())),
+        body.extend_from_slice(&chunk);
     }
+
+    // body is loaded, now we can deserialize serde-json
+    let obj = serde_json::from_slice::<MyObj>(&body)?;
+    Ok(HttpResponse::Ok().json(obj)) // <- send response
 }
 
-/// response body
-async fn response_body(path: web::Path<String>) -> HttpResponse {
-    let name = path.into_inner();
-
-    HttpResponse::Ok().streaming(stream! {
-        yield Ok::<_, Infallible>(web::Bytes::from("Hello "));
-        yield Ok::<_, Infallible>(web::Bytes::from(name));
-        yield Ok::<_, Infallible>(web::Bytes::from("!"));
-    })
-}
-
-/// handler with path parameters like `/user/{name}/`
-async fn with_param(req: HttpRequest, path: web::Path<(String,)>) -> HttpResponse {
-    println!("{req:?}");
-
-    HttpResponse::Ok()
-        .content_type(ContentType::plaintext())
-        .body(format!("Hello {}!", path.0))
+/// This handler manually load request payload and parse json-rust
+async fn index_mjsonrust(body: web::Bytes) -> Result<HttpResponse, Error> {
+    // body is loaded, now we can deserialize json-rust
+    let result = json::parse(std::str::from_utf8(&body).unwrap()); // return Result
+    let injson: JsonValue = match result {
+        Ok(v) => v,
+        Err(e) => json::object! {"err" => e.to_string() },
+    };
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(injson.dump()))
 }
 
 #[actix_web::main]
-async fn main() -> io::Result<()> {
+async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-
-    // random key means that restarting server will invalidate existing session cookies
-    let key = actix_web::cookie::Key::from(SESSION_SIGNING_KEY);
 
     log::info!("starting HTTP server at http://localhost:8080");
 
-    HttpServer::new(move || {
+    HttpServer::new(|| {
         App::new()
-            // enable automatic response compression - usually register this first
-            .wrap(middleware::Compress::default())
-            // cookie session middleware
-            .wrap(
-                SessionMiddleware::builder(CookieSessionStore::default(), key.clone())
-                    .cookie_secure(false)
-                    .build(),
-            )
-            // enable logger - always register Actix Web Logger middleware last
+            // enable logger
             .wrap(middleware::Logger::default())
-            // register favicon
-            .service(favicon)
-            // register simple route, handle all methods
-            .service(welcome)
-            // with path parameters
-            .service(web::resource("/user/{name}").route(web::get().to(with_param)))
-            // async response body
-            .service(web::resource("/async-body/{name}").route(web::get().to(response_body)))
+            .app_data(web::JsonConfig::default().limit(4096)) // <- limit size of the payload (global configuration)
+            .service(web::resource("/extractor").route(web::post().to(index)))
             .service(
-                web::resource("/test").to(|req: HttpRequest| match *req.method() {
-                    Method::GET => HttpResponse::Ok(),
-                    Method::POST => HttpResponse::MethodNotAllowed(),
-                    _ => HttpResponse::NotFound(),
-                }),
+                web::resource("/extractor2")
+                    .app_data(web::JsonConfig::default().limit(1024)) // <- limit size of the payload (resource level)
+                    .route(web::post().to(extract_item)),
             )
-            .service(web::resource("/error").to(|| async {
-                error::InternalError::new(
-                    io::Error::new(io::ErrorKind::Other, "test"),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
-            }))
-            // static files
-            .service(Files::new("/static", "static").show_files_listing())
-            // redirect
-            .service(
-                web::resource("/").route(web::get().to(|req: HttpRequest| async move {
-                    println!("{req:?}");
-                    HttpResponse::Found()
-                        .insert_header((header::LOCATION, "static/welcome.html"))
-                        .finish()
-                })),
-            )
-            // default
-            .default_service(web::to(default_handler))
+            .service(web::resource("/manual").route(web::post().to(index_manual)))
+            .service(web::resource("/mjsonrust").route(web::post().to(index_mjsonrust)))
+            .service(web::resource("/").route(web::post().to(index)))
     })
     .bind(("127.0.0.1", 8080))?
-    .workers(2)
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{body::to_bytes, dev::Service, http, test, web, App};
+
+    use super::*;
+
+    #[actix_web::test]
+    async fn test_index() {
+        let app =
+            test::init_service(App::new().service(web::resource("/").route(web::post().to(index))))
+                .await;
+
+        let req = test::TestRequest::post()
+            .uri("/")
+            .set_json(&MyObj {
+                name: "my-name".to_owned(),
+                number: 43,
+            })
+            .to_request();
+        let resp = app.call(req).await.unwrap();
+
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(body_bytes, r##"{"name":"my-name","number":43}"##);
+    }
 }
