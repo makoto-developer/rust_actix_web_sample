@@ -1,6 +1,21 @@
-# json
 
-Json's `Getting Started` guide using json (serde-json or json-rust) for Actix Web
+# Rust backend server
+
+## Feature
+
+- [ ] get method
+- [ ] post method
+- [ ] db crud
+- [ ] logger
+- [ ] validation
+- [ ] file io
+  - [ ] read setting files
+    - [ ] read json  
+    - [ ] read yaml  
+    - [ ] read toml  
+- [ ] post message for other db
+- [ ] auth
+- [ ] multi thread
 
 ## Usage
 
